@@ -96,6 +96,7 @@ termcolor==3.0.1
 tokenizers==0.19.1
 tomlkit==0.13.2
 torch==2.0.1
+torch-tensorrt
 tqdm==4.67.1
 traitlets==5.14.3
 transformers==4.41.2

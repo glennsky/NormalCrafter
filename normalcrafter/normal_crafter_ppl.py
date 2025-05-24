@@ -1,22 +1,31 @@
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Union
-
+import time
+import psutil
 import numpy as np
 import PIL.Image
 import torch
 import torch.nn.functional as F
 import math
+import logging # Added
 
-from diffusers.utils import BaseOutput, logging
+from diffusers.utils import BaseOutput
+# Import the existing logger setup from diffusers.utils
+from diffusers.utils import logging as diffusers_logging # Modified
 from diffusers.utils.torch_utils import is_compiled_module, randn_tensor
 from diffusers import DiffusionPipeline
 from diffusers.pipelines.stable_video_diffusion.pipeline_stable_video_diffusion import StableVideoDiffusionPipelineOutput, StableVideoDiffusionPipeline
 from PIL import Image
 import cv2
 
-logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+# Use the diffusers logger if no specific logger is passed
+logger = diffusers_logging.get_logger(__name__) # pylint: disable=invalid-name
 
 class NormalCrafterPipeline(StableVideoDiffusionPipeline):
+    def __init__(self, vae, image_encoder, feature_extractor, scheduler, unet, logger=None, use_nvtx: bool = False, **kwargs): # Modified
+        super().__init__(vae, image_encoder, feature_extractor, scheduler, unet, **kwargs) # Modified
+        self.logger = logger if logger else diffusers_logging.get_logger(self.__class__.__name__) # Modified
+        self.use_nvtx = use_nvtx # Added
 
     def _encode_image(self, image, device, num_videos_per_prompt, do_classifier_free_guidance, scale=1, image_size=None):
         dtype = next(self.image_encoder.parameters()).dtype
@@ -196,8 +205,20 @@ class NormalCrafterPipeline(StableVideoDiffusionPipeline):
 
         # 3. Encode input image using using clip. (num_image * num_videos_per_prompt, 1, 1024)
         image_embeddings = self._encode_image(images, device, num_videos_per_prompt, do_classifier_free_guidance=do_classifier_free_guidance, scale=encode_image_scale, image_size=encode_image_WH)
+        
         # 4. Encode input image using VAE
+        if self.use_nvtx and torch.cuda.is_available(): # Added
+            torch.cuda.nvtx.range_push("VAE Encode") # Added
+        self.logger.info(f"VRAM before VAE encoding: {torch.cuda.memory_allocated() / (1024**3):.2f} GB" if torch.cuda.is_available() else "N/A") # Modified
+        self.logger.info(f"RAM before VAE encoding: {psutil.virtual_memory().used / (1024**3):.2f} GB") # Modified
+        vae_encode_start_time = time.time()
         image_latents = self.ecnode_video_vae(images, chunk_size=decode_chunk_size).to(image_embeddings.dtype)
+        vae_encode_end_time = time.time()
+        if self.use_nvtx and torch.cuda.is_available(): # Added
+            torch.cuda.nvtx.range_pop() # Added
+        self.logger.info(f"VAE encoding time: {vae_encode_end_time - vae_encode_start_time:.2f} seconds") # Modified
+        self.logger.info(f"VRAM after VAE encoding: {torch.cuda.memory_allocated() / (1024**3):.2f} GB" if torch.cuda.is_available() else "N/A") # Modified
+        self.logger.info(f"RAM after VAE encoding: {psutil.virtual_memory().used / (1024**3):.2f} GB") # Modified
             
         # image_latents [num_frames, channels, height, width] ->[1, num_frames, channels, height, width]
         image_latents = image_latents.unsqueeze(0)
@@ -246,6 +267,11 @@ class NormalCrafterPipeline(StableVideoDiffusionPipeline):
                 num_to_replace_latents = last_se[1] - se[0]
                 to_replace_latents = pred[:, -num_to_replace_latents:]
 
+            if self.use_nvtx and torch.cuda.is_available(): # Added
+                torch.cuda.nvtx.range_push(f"UNet Window {i+1}/{len(ses)}") # Added
+            self.logger.info(f"Window {i+1}/{len(ses)} - VRAM before UNet: {torch.cuda.memory_allocated() / (1024**3):.2f} GB" if torch.cuda.is_available() else "N/A") # Modified
+            self.logger.info(f"Window {i+1}/{len(ses)} - RAM before UNet: {psutil.virtual_memory().used / (1024**3):.2f} GB") # Modified
+            unet_start_time = time.time()
             latents = self.generate(
                 num_inference_steps,
                 device,
@@ -262,6 +288,12 @@ class NormalCrafterPipeline(StableVideoDiffusionPipeline):
                 window_image_latents,
                 window_added_time_ids
             )
+            unet_end_time = time.time()
+            if self.use_nvtx and torch.cuda.is_available(): # Added
+                torch.cuda.nvtx.range_pop() # Added
+            self.logger.info(f"Window {i+1}/{len(ses)} - UNet processing time: {unet_end_time - unet_start_time:.2f} seconds") # Modified
+            self.logger.info(f"Window {i+1}/{len(ses)} - VRAM after UNet: {torch.cuda.memory_allocated() / (1024**3):.2f} GB" if torch.cuda.is_available() else "N/A") # Modified
+            self.logger.info(f"Window {i+1}/{len(ses)} - RAM after UNet: {psutil.virtual_memory().used / (1024**3):.2f} GB") # Modified
             
             # merge last_latents and current latents in overlap window
             if to_replace_latents is not None and use_linear_merge:
@@ -288,7 +320,18 @@ class NormalCrafterPipeline(StableVideoDiffusionPipeline):
                 frames = frames * 2 - 1 # from range(0, 1) -> range(-1, 1)
                 return frames
             
+            if self.use_nvtx and torch.cuda.is_available(): # Added
+                torch.cuda.nvtx.range_push("VAE Decode") # Added
+            self.logger.info(f"VRAM before VAE decoding: {torch.cuda.memory_allocated() / (1024**3):.2f} GB" if torch.cuda.is_available() else "N/A") # Modified
+            self.logger.info(f"RAM before VAE decoding: {psutil.virtual_memory().used / (1024**3):.2f} GB") # Modified
+            vae_decode_start_time = time.time()
             frames = decode_latents(pred, num_frames, decode_chunk_size)
+            vae_decode_end_time = time.time()
+            if self.use_nvtx and torch.cuda.is_available(): # Added
+                torch.cuda.nvtx.range_pop() # Added
+            self.logger.info(f"VAE decoding time: {vae_decode_end_time - vae_decode_start_time:.2f} seconds") # Modified
+            self.logger.info(f"VRAM after VAE decoding: {torch.cuda.memory_allocated() / (1024**3):.2f} GB" if torch.cuda.is_available() else "N/A") # Modified
+            self.logger.info(f"RAM after VAE decoding: {psutil.virtual_memory().used / (1024**3):.2f} GB") # Modified
             if pad_HWs is not None:
                 frames = self.unpad_image(frames, pad_HWs)
         else:

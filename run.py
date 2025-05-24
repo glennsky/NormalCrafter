@@ -1,7 +1,12 @@
 import gc
 import os
+import time
+import psutil
 import numpy as np
 import torch
+from torch.nn import DataParallel
+import logging # Added
+from typing import Optional # Added
 
 from diffusers.training_utils import set_seed
 from diffusers import AutoencoderKLTemporalDecoder
@@ -18,7 +23,15 @@ class DepthCrafterDemo:
         unet_path: str,
         pre_train_path: str,
         cpu_offload: str = "model",
+        logger=None, # Added
+        use_nvtx: bool = False, # Added
+        use_tensorrt: bool = False, # Added
     ):
+        self.logger = logger if logger else logging.getLogger(__name__) # Added
+        self.use_nvtx = use_nvtx # Added
+        self.use_tensorrt = use_tensorrt # Added
+        self.cpu_offload = cpu_offload # Added to store for later check
+
         unet = DiffusersUNetSpatioTemporalConditionModelNormalCrafter.from_pretrained(
             unet_path,
             subfolder="unet",
@@ -37,25 +50,69 @@ class DepthCrafterDemo:
             vae=vae,
             torch_dtype=weight_dtype,
             variant="fp16",
+            logger=self.logger, # Added
+            use_nvtx=self.use_nvtx, # Added
         )
 
+        if self.use_tensorrt and self.cpu_offload is None and torch.cuda.is_available():
+            self.logger.info("Attempting TensorRT compilation...")
+            # Ensure components are on CUDA before TensorRT compilation
+            if not next(self.pipe.unet.parameters()).is_cuda:
+                self.pipe.unet.to("cuda")
+            if not next(self.pipe.vae.parameters()).is_cuda:
+                self.pipe.vae.to("cuda")
+
+            try:
+                self.logger.info("Attempting TensorRT compilation for UNet...")
+                self.pipe.unet = torch.compile(
+                    self.pipe.unet,
+                    backend="torch_tensorrt",
+                    options={
+                        "enabled_precisions": {torch.float16},
+                        "truncate_long_and_double": True,
+                    },
+                    dynamic=False
+                )
+                self.logger.info("UNet compiled with TensorRT successfully.")
+            except Exception as e:
+                self.logger.error(f"TensorRT compilation for UNet failed: {e}. Proceeding without TensorRT for UNet.")
+
+            try:
+                self.logger.info("Attempting TensorRT compilation for VAE...")
+                self.pipe.vae = torch.compile(
+                    self.pipe.vae,
+                    backend="torch_tensorrt",
+                    options={
+                        "enabled_precisions": {torch.float16},
+                        "truncate_long_and_double": True,
+                    },
+                    dynamic=False
+                )
+                self.logger.info("VAE compiled with TensorRT successfully.")
+            except Exception as e:
+                self.logger.error(f"TensorRT compilation for VAE failed: {e}. Proceeding without TensorRT for VAE.")
+
+        if self.cpu_offload is None and torch.cuda.device_count() > 1: # Modified to use self.cpu_offload
+            self.logger.info(f"Using {torch.cuda.device_count()} GPUs for UNet (DataParallel).") # Modified
+            self.pipe.unet = DataParallel(self.pipe.unet)
+
         # for saving memory, we can offload the model to CPU, or even run the model sequentially to save more memory
-        if cpu_offload is not None:
-            if cpu_offload == "sequential":
+        if self.cpu_offload is not None: # Modified to use self.cpu_offload
+            if self.cpu_offload == "sequential":
                 # This will slow, but save more memory
                 self.pipe.enable_sequential_cpu_offload()
-            elif cpu_offload == "model":
+            elif self.cpu_offload == "model":
                 self.pipe.enable_model_cpu_offload()
             else:
-                raise ValueError(f"Unknown cpu offload option: {cpu_offload}")
+                raise ValueError(f"Unknown cpu offload option: {self.cpu_offload}")
         else:
             self.pipe.to("cuda")
         # enable attention slicing and xformers memory efficient attention
         try:
             self.pipe.enable_xformers_memory_efficient_attention()
         except Exception as e:
-            print(e)
-            print("Xformers is not enabled")
+            self.logger.warning(e) # Modified
+            self.logger.warning("Xformers is not enabled") # Modified
         # self.pipe.enable_attention_slicing()
 
     def infer(
@@ -74,6 +131,10 @@ class DepthCrafterDemo:
     ):
         set_seed(seed)
 
+        self.logger.info(f"Initial RAM used: {psutil.virtual_memory().used / (1024**3):.2f} GB") # Modified
+        if torch.cuda.is_available():
+            self.logger.info(f"Initial VRAM used (GPU 0): {torch.cuda.memory_allocated(0) / (1024**3):.2f} GB") # Modified
+
         frames, target_fps = read_video_frames(
             video,
             process_length,
@@ -82,12 +143,22 @@ class DepthCrafterDemo:
         )
         # inference the depth map using the DepthCrafter pipeline
         with torch.inference_mode():
+            if self.use_nvtx and torch.cuda.is_available(): # Added
+                torch.cuda.nvtx.range_push("NormalCrafterPipeline.call") # Added
+            start_time = time.time()
             res = self.pipe(
                 frames,
                 decode_chunk_size=decode_chunk_size,
                 time_step_size=time_step_size,
                 window_size=window_size,
             ).frames[0]
+            end_time = time.time()
+            if self.use_nvtx and torch.cuda.is_available(): # Added
+                torch.cuda.nvtx.range_pop() # Added
+            self.logger.info(f"Pipeline processing time: {end_time - start_time:.2f} seconds") # Modified
+            self.logger.info(f"RAM used after pipeline: {psutil.virtual_memory().used / (1024**3):.2f} GB") # Modified
+            if torch.cuda.is_available():
+                self.logger.info(f"VRAM used after pipeline (GPU 0): {torch.cuda.memory_allocated(0) / (1024**3):.2f} GB") # Modified
         # visualize the depth map and save the results
         vis = vis_sequence_normal(res)
         # save the depth map and visualization with the target FPS
@@ -139,12 +210,32 @@ def main(
     time_step_size: int = 10,
     max_res: int = 1024,
     dataset: str = "open",
-    save_npz: bool = False
+    save_npz: bool = False,
+    log_file: Optional[str] = None, # Added
+    use_nvtx: bool = False, # Added
+    use_tensorrt: bool = False, # Added
 ):
+    # Setup Logger
+    logger = logging.getLogger(__name__) # Added
+    logger.setLevel(logging.INFO) # Added
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s') # Added
+
+    ch = logging.StreamHandler() # Added
+    ch.setFormatter(formatter) # Added
+    logger.addHandler(ch) # Added
+
+    if log_file: # Added
+        fh = logging.FileHandler(log_file) # Added
+        fh.setFormatter(formatter) # Added
+        logger.addHandler(fh) # Added
+
     depthcrafter_demo = DepthCrafterDemo(
         unet_path=unet_path,
         pre_train_path=pre_train_path,
         cpu_offload=cpu_offload,
+        logger=logger, # Added
+        use_nvtx=use_nvtx, # Added
+        use_tensorrt=use_tensorrt, # Added
     )
     # process the videos, the video paths are separated by comma
     video_paths = video_path.split(",")
@@ -160,6 +251,7 @@ def main(
             target_fps=target_fps,
             seed=seed,
             save_npz=save_npz,
+            decode_chunk_size=decode_chunk_size,
         )
         # clear the cache for the next video
         gc.collect()
