@@ -298,17 +298,13 @@ def main(
     # -------------------------------
 
     # Check NVTX availability if requested
-    if use_nvtx: # If user intended to use NVTX
-        try:
-            import torch.cuda.nvtx
+    if use_nvtx:
+        # since torch is already imported at module scope, just check for nvtx
+        if not (hasattr(torch, "cuda") and hasattr(torch.cuda, "nvtx")):
+            logger.warning("torch.cuda.nvtx not available. NVTX ranges will be disabled.")
+            use_nvtx = False
+        else:
             logger.info("NVTX library found. NVTX ranges will be used.")
-        except ImportError:
-            logger.warning("torch.cuda.nvtx module not found. NVTX ranges will be disabled. Ensure PyTorch is compiled with CUDA and NVTX support.")
-            use_nvtx = False
-        except AttributeError: # Handles cases where torch.cuda might exist but not nvtx
-            logger.warning("torch.cuda.nvtx attribute not found. NVTX ranges will be disabled. Ensure PyTorch is compiled with CUDA and NVTX support.")
-            use_nvtx = False
-
 
     depthcrafter_demo = DepthCrafterDemo(
         unet_path=unet_path,
