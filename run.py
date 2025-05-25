@@ -11,10 +11,12 @@ from typing import Optional # Added
 from diffusers.training_utils import set_seed
 from diffusers import AutoencoderKLTemporalDecoder
 from fire import Fire
+import json
 
 from normalcrafter.normal_crafter_ppl import NormalCrafterPipeline
 from normalcrafter.unet import DiffusersUNetSpatioTemporalConditionModelNormalCrafter
 from normalcrafter.utils import vis_sequence_normal, save_video, read_video_frames
+from diffusers import StableVideoDiffusionPipeline
 
 
 class DepthCrafterDemo:
@@ -23,38 +25,63 @@ class DepthCrafterDemo:
         unet_path: str,
         pre_train_path: str,
         cpu_offload: str = "model",
-        logger=None, # Added
-        use_nvtx: bool = False, # Added
-        use_tensorrt: bool = False, # Added
+        logger=None,
+        use_nvtx: bool = False,
+        use_tensorrt: bool = False,
     ):
-        self.logger = logger if logger else logging.getLogger(__name__) # Added
-        self.use_nvtx = use_nvtx # Added
-        self.use_tensorrt = use_tensorrt # Added
-        self.cpu_offload = cpu_offload # Added to store for later check
+        self.logger = logger if logger else logging.getLogger(__name__)
+        self.use_nvtx = use_nvtx
+        self.use_tensorrt = use_tensorrt
+        self.cpu_offload = cpu_offload
 
+        # Load components individually
         unet = DiffusersUNetSpatioTemporalConditionModelNormalCrafter.from_pretrained(
             unet_path,
             subfolder="unet",
             low_cpu_mem_usage=True,
+            torch_dtype=torch.float16
         )
         vae = AutoencoderKLTemporalDecoder.from_pretrained(
-            unet_path, subfolder="vae"
+            unet_path, 
+            subfolder="vae",
+            torch_dtype=torch.float16
         )
-        weight_dtype = torch.float16
-        vae.to(dtype=weight_dtype)
-        unet.to(dtype=weight_dtype)
-        # load weights of other components from the provided checkpoint
-        self.pipe = NormalCrafterPipeline.from_pretrained(
+        
+        # Load the base pipeline to get other components
+        base_pipe = StableVideoDiffusionPipeline.from_pretrained(
             pre_train_path,
-            unet=unet,
-            vae=vae,
-            torch_dtype=weight_dtype,
-            variant="fp16",
-            logger=self.logger, # Added
-            use_nvtx=self.use_nvtx, # Added
+            torch_dtype=torch.float16,
+            variant="fp16"
         )
+        
+        # Create the NormalCrafterPipeline by copying from base pipeline and replacing components
+        self.pipe = NormalCrafterPipeline(
+            vae=vae,
+            image_encoder=base_pipe.image_encoder,
+            feature_extractor=base_pipe.feature_extractor,
+            scheduler=base_pipe.scheduler,
+            unet=unet
+        )
+        
+        # Manually set the config to avoid component mapping issues
+        self.pipe.register_modules(
+            vae=vae,
+            image_encoder=base_pipe.image_encoder,
+            feature_extractor=base_pipe.feature_extractor,
+            scheduler=base_pipe.scheduler,
+            unet=unet
+        )
+        
+        # Debug: Print component types
+        self.logger.info(f"UNet type: {type(self.pipe.unet)}")
+        self.logger.info(f"VAE type: {type(self.pipe.vae)}")
+        self.logger.info(f"Feature extractor type: {type(self.pipe.feature_extractor)}")
+        self.logger.info(f"Image encoder type: {type(self.pipe.image_encoder)}")
+        self.logger.info(f"Scheduler type: {type(self.pipe.scheduler)}")
+        
+        self.logger.info("Pipeline created successfully with manual component loading")
 
-        if self.use_tensorrt and self.cpu_offload is None and torch.cuda.is_available():
+        if self.use_tensorrt and self.cpu_offload != "model" and self.cpu_offload != "sequential" and torch.cuda.is_available():
             self.logger.info("Attempting TensorRT compilation...")
             # Ensure components are on CUDA before TensorRT compilation
             if not next(self.pipe.unet.parameters()).is_cuda:
@@ -92,28 +119,44 @@ class DepthCrafterDemo:
             except Exception as e:
                 self.logger.error(f"TensorRT compilation for VAE failed: {e}. Proceeding without TensorRT for VAE.")
 
-        if self.cpu_offload is None and torch.cuda.device_count() > 1: # Modified to use self.cpu_offload
-            self.logger.info(f"Using {torch.cuda.device_count()} GPUs for UNet (DataParallel).") # Modified
+        if self.cpu_offload != "model" and self.cpu_offload != "sequential" and torch.cuda.device_count() > 1:
+            self.logger.info(f"Using {torch.cuda.device_count()} GPUs for UNet (DataParallel).")
             self.pipe.unet = DataParallel(self.pipe.unet)
 
-        # for saving memory, we can offload the model to CPU, or even run the model sequentially to save more memory
-        if self.cpu_offload is not None: # Modified to use self.cpu_offload
-            if self.cpu_offload == "sequential":
-                # This will slow, but save more memory
-                self.pipe.enable_sequential_cpu_offload()
-            elif self.cpu_offload == "model":
-                self.pipe.enable_model_cpu_offload()
-            else:
-                raise ValueError(f"Unknown cpu offload option: {self.cpu_offload}")
+        # Handle CPU offload with try-catch to avoid the components error
+        if self.cpu_offload == "sequential" or self.cpu_offload == "model":
+            try:
+                if self.cpu_offload == "sequential":
+                    # This will slow, but save more memory
+                    self.pipe.enable_sequential_cpu_offload()
+                elif self.cpu_offload == "model":
+                    self.pipe.enable_model_cpu_offload()
+            except Exception as e:
+                self.logger.warning(f"CPU offload failed: {e}. Proceeding without CPU offload.")
+                # Fallback: move to CUDA manually
+                if torch.cuda.is_available():
+                    try:
+                        self.pipe.unet.to("cuda")
+                        self.pipe.vae.to("cuda")
+                        self.pipe.image_encoder.to("cuda")
+                    except:
+                        pass
         else:
-            self.pipe.to("cuda")
+            # Move components to CUDA manually
+            if torch.cuda.is_available():
+                try:
+                    self.pipe.unet.to("cuda")
+                    self.pipe.vae.to("cuda")
+                    self.pipe.image_encoder.to("cuda")
+                except Exception as e:
+                    self.logger.warning(f"Failed to move some components to CUDA: {e}")
+        
         # enable attention slicing and xformers memory efficient attention
         try:
             self.pipe.enable_xformers_memory_efficient_attention()
         except Exception as e:
-            self.logger.warning(e) # Modified
-            self.logger.warning("Xformers is not enabled") # Modified
-        # self.pipe.enable_attention_slicing()
+            self.logger.warning(e)
+            self.logger.warning("Xformers is not enabled")
 
     def infer(
         self,
@@ -208,6 +251,7 @@ def main(
     seed: int = 42,
     window_size: int = 14,
     time_step_size: int = 10,
+    decode_chunk_size: int = 7, # Add this parameter
     max_res: int = 1024,
     dataset: str = "open",
     save_npz: bool = False,
@@ -228,6 +272,30 @@ def main(
         fh = logging.FileHandler(log_file) # Added
         fh.setFormatter(formatter) # Added
         logger.addHandler(fh) # Added
+
+    # -------------------------------
+    # Print all current run settings
+    settings = {
+        "video_path":             video_path,
+        "save_folder":            save_folder,
+        "unet_path":              unet_path,
+        "pre_train_path":         pre_train_path,
+        "process_length":         process_length,
+        "cpu_offload":            cpu_offload,
+        "target_fps":             target_fps,
+        "seed":                   seed,
+        "window_size":            window_size,
+        "time_step_size":         time_step_size,
+        "decode_chunk_size":      decode_chunk_size,
+        "max_res":                max_res,
+        "dataset":                dataset,
+        "save_npz":               save_npz,
+        "log_file":               log_file,
+        "use_nvtx":               use_nvtx,
+        "use_tensorrt":           use_tensorrt,
+    }
+    logger.info("Current run settings:\n%s", json.dumps(settings, indent=4))
+    # -------------------------------
 
     depthcrafter_demo = DepthCrafterDemo(
         unet_path=unet_path,

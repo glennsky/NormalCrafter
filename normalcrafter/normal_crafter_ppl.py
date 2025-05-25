@@ -22,10 +22,28 @@ import cv2
 logger = diffusers_logging.get_logger(__name__) # pylint: disable=invalid-name
 
 class NormalCrafterPipeline(StableVideoDiffusionPipeline):
-    def __init__(self, vae, image_encoder, feature_extractor, scheduler, unet, logger=None, use_nvtx: bool = False, **kwargs): # Modified
-        super().__init__(vae, image_encoder, feature_extractor, scheduler, unet, **kwargs) # Modified
-        self.logger = logger if logger else diffusers_logging.get_logger(self.__class__.__name__) # Modified
-        self.use_nvtx = use_nvtx # Added
+    def __init__(self, vae, image_encoder, feature_extractor, scheduler, unet, **kwargs):
+        # Extract custom parameters from kwargs before calling super()
+        logger = kwargs.pop('logger', None)
+        use_nvtx = kwargs.pop('use_nvtx', False)
+        
+        # Call parent constructor
+        super().__init__(vae, image_encoder, feature_extractor, scheduler, unet, **kwargs)
+        
+        # Set custom attributes
+        self.logger = logger if logger else diffusers_logging.get_logger(self.__class__.__name__)
+        self.use_nvtx = use_nvtx
+
+    @property
+    def components(self):
+        # Override the components property to return only the actual components
+        return {
+            "vae": self.vae,
+            "image_encoder": self.image_encoder,
+            "feature_extractor": self.feature_extractor,
+            "scheduler": self.scheduler,
+            "unet": self.unet,
+        }
 
     def _encode_image(self, image, device, num_videos_per_prompt, do_classifier_free_guidance, scale=1, image_size=None):
         dtype = next(self.image_encoder.parameters()).dtype
