@@ -229,6 +229,18 @@ def main(
         fh.setFormatter(formatter) # Added
         logger.addHandler(fh) # Added
 
+    # Check NVTX availability if requested
+    if use_nvtx: # If user intended to use NVTX
+        try:
+            import torch.cuda.nvtx
+            logger.info("NVTX library found. NVTX ranges will be used.")
+        except ImportError:
+            logger.warning("torch.cuda.nvtx module not found. NVTX ranges will be disabled. Ensure PyTorch is compiled with CUDA and NVTX support.")
+            use_nvtx = False
+        except AttributeError: # Handles cases where torch.cuda might exist but not nvtx
+            logger.warning("torch.cuda.nvtx attribute not found. NVTX ranges will be disabled. Ensure PyTorch is compiled with CUDA and NVTX support.")
+            use_nvtx = False
+
     depthcrafter_demo = DepthCrafterDemo(
         unet_path=unet_path,
         pre_train_path=pre_train_path,

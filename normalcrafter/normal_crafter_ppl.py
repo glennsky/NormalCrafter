@@ -22,10 +22,26 @@ import cv2
 logger = diffusers_logging.get_logger(__name__) # pylint: disable=invalid-name
 
 class NormalCrafterPipeline(StableVideoDiffusionPipeline):
-    def __init__(self, vae, image_encoder, feature_extractor, scheduler, unet, logger=None, use_nvtx: bool = False, **kwargs): # Modified
-        super().__init__(vae, image_encoder, feature_extractor, scheduler, unet, **kwargs) # Modified
-        self.logger = logger if logger else diffusers_logging.get_logger(self.__class__.__name__) # Modified
-        self.use_nvtx = use_nvtx # Added
+    def __init__(self, vae, image_encoder, feature_extractor, scheduler, unet, logger=None, use_nvtx: bool = False, **huggingface_pipeline_kwargs): # Parameter name `kwargs` changed to `huggingface_pipeline_kwargs` for clarity
+        # Call the superclass init with only the arguments it expects.
+        # StableVideoDiffusionPipeline.__init__ does not accept **kwargs.
+        super().__init__(
+            vae=vae, 
+            image_encoder=image_encoder, 
+            feature_extractor=feature_extractor, 
+            scheduler=scheduler, 
+            unet=unet
+        )
+        
+        # Handle custom arguments for NormalCrafterPipeline
+        # Ensure diffusers_logging is available if logger is None
+        # (it should be imported as `from diffusers.utils import logging as diffusers_logging`)
+        self.logger = logger if logger is not None else diffusers_logging.get_logger(self.__class__.__name__)
+        self.use_nvtx = use_nvtx
+        
+        # Store any other kwargs if needed by NormalCrafterPipeline specifically for its own use
+        self.huggingface_pipeline_kwargs = huggingface_pipeline_kwargs 
+        # (Or simply remove if these extra kwargs are not used by NormalCrafterPipeline itself)
 
     def _encode_image(self, image, device, num_videos_per_prompt, do_classifier_free_guidance, scale=1, image_size=None):
         dtype = next(self.image_encoder.parameters()).dtype
